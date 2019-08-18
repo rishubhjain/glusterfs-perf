@@ -1,0 +1,136 @@
+---
+- hosts:
+      benki1-nic2.lab.eng.blr.redhat.com:
+      benki2-nic2.lab.eng.blr.redhat.com:
+      benki3-nic2.lab.eng.blr.redhat.com:
+  gather_facts: true
+  remote_user: root
+  vars:
+      volume_count: 2000
+      glusterfs_perf_servers:
+            - benki1-nic2.lab.eng.blr.redhat.com
+            - benki2-nic2.lab.eng.blr.redhat.com
+            - benki3-nic2.lab.eng.blr.redhat.com
+      glusterfs_perf_server: benki1-nic2.lab.eng.blr.redhat.com
+      glusterfs_perf_hosts: "{{ groups['gluster_nodes'] }}"
+      glusterfs_perf_tag: nightly
+  tasks:
+
+    - file:
+        path: /dist1
+        state: directory
+        mode: 0755
+        owner: root
+        group: root
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+      ignore_errors: yes
+
+    - file:
+        path: /tmp/cores
+        state: directory
+        mode: 0755
+        owner: root
+        group: root
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+      ignore_errors: yes
+
+    - name: Configure core location to save core
+      shell: "echo /tmp/cores/core.%e.%p.%h.%t > /proc/sys/kernel/core_pattern"
+      args:
+       warn: false
+      register: configure_core_locaiton
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+      ignore_errors: yes
+
+    - name: Start glusterd
+      command: glusterd
+      changed_when: False
+      register: start_glusterd
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+
+    - name: Peer probe
+      shell: gluster peer probe {{ item }}
+      register: gluster_peer_probe
+      with_items: "{{ groups['gluster_nodes'] }}"
+      ignore_errors: yes
+
+    - name: Enable brick_multiplex on all gluster volumes
+      shell: "echo y | gluster volume set all cluster.brick-multiplex on"
+      register: enable_brick_multiplex_
+      with_items: "{{ groups['gluster_nodes'][0] }}"
+
+    - name: Create several gluster volumes
+      shell: "gluster v create test{{ item }} replica 3 {{ groups['gluster_nodes'][0] }}:/dist1/b{{ item }} {{ groups['gluster_nodes'][1] }}:/dist1/b{{ item }} {{ groups['gluster_nodes'][2] }}:/dist1/b{{ item }} force; gluster v start test{{item}}"
+      with_sequence:
+         start=1 end={{ volume_count }}
+      delegate_to: "{{ groups['gluster_nodes'][1] }}"
+
+    - name: Stop glusterd on first node
+      shell: "kill -9 `pgrep glusterd`"
+      changed_when: False
+      register: stop_glusterd
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'][1] }}"
+
+    - name: Check brick process should be up and running
+      shell: "test $(ps -aef | grep glusterfsd | grep -v grep | wc -l) -ne 0"
+      register: check_brick_status
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+
+    - name: Enable Readdir-ahead option for several volumes
+      shell: "gluster volume set {{ item }} performance.readdir-ahead on"
+      register: enable_readdir_ahead
+      with_sequence:
+         start=1 end={{ volume_count }} stride=40 format=test%d
+
+    - name: Start glusterd on first node
+      command: glusterd
+      changed_when: False
+      register: start_glusterd
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'][1] }}"
+
+    # Pause for 120 sec to stable glusterd on 2nd node
+    - pause:
+        seconds: 300
+
+    - name: Check peer status on all nodes
+      shell: "test $(gluster peer status | grep Connected | wc -l) -eq 2"
+      register: check_peer_status
+      until: check_peer_status.rc == 0
+      retries: 20
+      delay: 4
+      ignore_errors: yes
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+
+    - name: Check Readdir-ahead option for several volumes
+      shell: "gluster volume info {{ item }} | grep -iw 'performance.readdir-ahead: on'"
+      register: task_result
+      until: task_result.rc == 0
+      retries: 20
+      delay: 2
+      with_sequence:
+         start=1 end={{ volume_count }} stride=40 format=test%d
+      delegate_to: "{{ groups['gluster_nodes'][1] }}"
+
+    - name: Stop gluster volumes and capture Memory consumption for all brick process
+      shell: "for v in $(gluster v list); do gluster v stop $v --mode=script; sleep 1; gluster v delete $v --mode=script; done; for pid in `pgrep glusterfsd`; do echo \"Memory consumption for brick pid $pid is `date`\" >> /tmp/pp; pmap -x $pid | grep              total >> /tmp/pp; done"
+      delegate_to: "{{ groups['gluster_nodes'][1] }}"
+
+    - name: Check about call_bail message in glusterd.log
+      shell: "test $(grep -i call_bail /var/log/glusterfs/glusterd.log | wc -l) -eq 0"
+      register: check_if_call_bail
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
+
+    - name: Check if any core file generated 
+      shell: "test $(ls /tmp/cores/* | wc -l) -eq 0"
+      register: check_if_core_file_generated
+      delegate_to: "{{ item }}"
+      with_items: "{{ groups['gluster_nodes'] }}"
